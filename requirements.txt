@@ -1,3 +1,12 @@
-streamlit==1.58.0
-pypdf==6.13.1
-requests==2.34.2
+streamlit
+langchain
+langchain-community
+langchain-text-splitters
+langchain-openai
+langchain-chroma
+langchain-classic
+langchain-core
+pypdf
+python-dotenv
+protobuf==3.20.3
+requests
