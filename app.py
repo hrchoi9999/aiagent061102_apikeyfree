@@ -1,133 +1,121 @@
-import os
-import tempfile
+import re
+from typing import Iterable
 
+import requests
 import streamlit as st
-from langchain_community.document_loaders import (  PyPDFLoader )
-from langchain_text_splitters import (    RecursiveCharacterTextSplitter )
-from langchain_chroma import (    Chroma  )
-from langchain_openai import   OpenAIEmbeddings,    ChatOpenAI 
-from langchain_classic.chains import (   create_retrieval_chain )
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from pypdf import PdfReader
 
-from langchain_core.prompts import (   ChatPromptTemplate )
-from langchain_core.callbacks import   BaseCallbackHandler
+
+st.set_page_config(page_title="PDF File Reader", page_icon="📄", layout="centered")
 
 st.title("📄 PDF File Reader")
 st.write("----------------")
 
-
-openai_key = st.text_input(  "OPENAI_API_KEY",    type="password" )
-
-uploaded_file = st.file_uploader(   "PDF 파일을 올려주세요",   type=["pdf"] )
+openai_key = st.text_input("OPENAI_API_KEY", type="password")
+uploaded_file = st.file_uploader("PDF 파일을 올려주세요", type=["pdf"])
 st.write("----------------")
 
-def pdf_to_document(uploaded_file):
-    """    Streamlit 업로드 PDF를
-    LangChain Document 형태로 변환
-    """
-    # 임시 폴더 생성
-    temp_dir = tempfile.TemporaryDirectory()
 
-    # 임시 PDF 파일
-    temp_filepath = os.path.join(     temp_dir.name,    uploaded_file.name    )
+def extract_pdf_text(uploaded_pdf) -> str:
+    reader = PdfReader(uploaded_pdf)
+    pages: list[str] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append(f"[{page_number}페이지]\n{text.strip()}")
+    return "\n\n".join(pages)
 
-    with open(   temp_filepath,    "wb"  ) as f:
-        f.write(    uploaded_file.getvalue()    )
 
-    loader = PyPDFLoader(   temp_filepath   )
+def split_text(text: str, chunk_size: int = 900, overlap: int = 120) -> list[str]:
+    clean_text = re.sub(r"\s+", " ", text).strip()
+    if not clean_text:
+        return []
 
-    pages = loader.load()
-    return pages
+    chunks: list[str] = []
+    start = 0
+    while start < len(clean_text):
+        end = min(start + chunk_size, len(clean_text))
+        chunks.append(clean_text[start:end])
+        if end == len(clean_text):
+            break
+        start = max(0, end - overlap)
+    return chunks
 
-class StreamHandler(  BaseCallbackHandler ):
-    """
-    GPT가 토큰을 생성할 때마다
-    Streamlit 화면에 출력하는 Handler
 
-    예:
-    GPT:   안녕하세요
-    생성 과정:
-    안
-    안녕
-    안녕하세요
+def keyword_terms(question: str) -> list[str]:
+    terms = re.findall(r"[가-힣A-Za-z0-9]{2,}", question.lower())
+    return list(dict.fromkeys(terms))
 
-    처럼 실시간 출력
-    """
-    def __init__(  self,    container  ):
-        self.container = container
-        self.text = ""
 
-    def on_llm_new_token(  self,  token,   **kwargs ):
-        # 새 토큰 누적
-        self.text += token
-        # 화면 갱신
-        self.container.markdown(    self.text  )
+def select_context(chunks: Iterable[str], question: str, limit: int = 4) -> str:
+    terms = keyword_terms(question)
+    scored: list[tuple[int, str]] = []
+    for chunk in chunks:
+        lower_chunk = chunk.lower()
+        score = sum(lower_chunk.count(term) for term in terms)
+        scored.append((score, chunk))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = [chunk for score, chunk in scored[:limit] if score > 0]
+    if not selected:
+        selected = [chunk for _, chunk in scored[:limit]]
+    return "\n\n".join(selected)
+
+
+def ask_openai(api_key: str, question: str, context: str) -> str:
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "gpt-4.1-mini",
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "PDF 내용만 근거로 한국어로 답하세요. 근거가 부족하면 부족하다고 말하세요.",
+                },
+                {
+                    "role": "user",
+                    "content": f"질문: {question}\n\nPDF 내용:\n{context}",
+                },
+            ],
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
 
 if uploaded_file is not None:
     if not openai_key.strip():
         st.info("OPENAI_API_KEY를 입력한 뒤 PDF를 분석할 수 있습니다.")
         st.stop()
 
-    pages = pdf_to_document(   uploaded_file   )
-    # st.success(   f"PDF 페이지 : {len(pages)}"  )
+    pdf_text = extract_pdf_text(uploaded_file)
+    if not pdf_text:
+        st.error("PDF에서 텍스트를 추출하지 못했습니다.")
+        st.stop()
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
-    )
+    chunks = split_text(pdf_text)
+    st.success(f"PDF 텍스트 추출 완료: {len(chunks)}개 문단")
 
-    texts = text_splitter.split_documents(    pages   )
+    st.header("PDF에게 질문하세요")
+    question = st.text_input("질문 입력")
 
-    # st.info(  f"문서 조각 : {len(texts)}"  )
-
-    embeddings = OpenAIEmbeddings(  api_key=openai_key   )
-
-    db = Chroma.from_documents(
-        documents=texts,
-        embedding=embeddings
-    )
-
-    retriever = db.as_retriever(
-        search_kwargs={
-            "k":3
-        }
-    )
-
-    st.header(   "PDF에게 질문하세요"   )
-    question = st.text_input(   "질문 입력"    )
-
-    if st.button(   "질문하기"   ):
-        if question == "":
-            st.warning( "질문을 입력하세요"   )
+    if st.button("질문하기"):
+        if question.strip() == "":
+            st.warning("질문을 입력하세요")
         else:
-            with st.spinner(  "답변 생성중..."  ,show_time=True  ): 
-
-                chat_box = st.empty()
-
-                handler = StreamHandler(      chat_box       )
-
-                llm = ChatOpenAI(
-                    model="gpt-4.1-mini",
-                    temperature=0,
-                    api_key=openai_key,
-                    streaming=True,
-                    callbacks=[ handler  ]
-                )
-
-                prompt = ChatPromptTemplate.from_template(
-                    """
-                    당신은 PDF 분석 AI 입니다.
-                    Context:   {context}
-                    Question:  {input}
-                    답변:
-                    """
-                )
-
-                document_chain = ( create_stuff_documents_chain(   llm,    prompt    )   )
-
-                qa_chain = create_retrieval_chain(
-                    retriever,
-                    document_chain
-                )
-
-                qa_chain.invoke(    {    "input": question    }      )
+            with st.spinner("답변 생성중...", show_time=True):
+                try:
+                    context = select_context(chunks, question)
+                    answer = ask_openai(openai_key.strip(), question.strip(), context)
+                    st.markdown(answer)
+                except requests.HTTPError as exc:
+                    st.error(f"OpenAI API 오류가 발생했습니다: {exc.response.text}")
+                except Exception as exc:
+                    st.error(f"답변 생성 중 오류가 발생했습니다: {exc}")
